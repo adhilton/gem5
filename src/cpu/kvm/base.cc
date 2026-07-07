@@ -42,8 +42,10 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <csignal>
+#include <ctime>
 #include <ostream>
 
 #include "base/compiler.hh"
@@ -53,6 +55,7 @@
 #include "debug/KvmIO.hh"
 #include "debug/KvmRun.hh"
 #include "params/BaseKvmCPU.hh"
+#include "sim/core.hh"
 #include "sim/process.hh"
 #include "sim/system.hh"
 
@@ -760,10 +763,13 @@ BaseKvmCPU::kvmRun(Tick ticks)
         // force an exit from KVM by kicking the vCPU.
         EventQueue::ScopedRelease release(curEventQueue());
 
-        if (ticks < runTimer->resolution()) {
-            DPRINTF(KvmRun, "KVM: Adjusting tick count (%i -> %i)\n",
-                    ticks, runTimer->resolution());
-            ticks = runTimer->resolution();
+        Tick min_ticks =
+            100 * sim_clock::as_int::us; // 100 microseconds minimum quantum
+        Tick sync_ticks = std::max(runTimer->resolution(), min_ticks);
+        if (ticks < sync_ticks) {
+            DPRINTF(KvmRun, "KVM: Adjusting tick count (%i -> %i)\n", ticks,
+                    sync_ticks);
+            ticks = sync_ticks;
         }
 
         // Get hardware statistics after synchronizing contexts. The KVM
@@ -783,7 +789,20 @@ BaseKvmCPU::kvmRun(Tick ticks)
             hwCycles->start();
         }
 
+        struct timespec ts_start;
+        if (!usePerf) {
+            clock_gettime(CLOCK_MONOTONIC, &ts_start);
+        }
+
         ioctlRun();
+
+        uint64_t elapsed_ns = 0;
+        if (!usePerf) {
+            struct timespec ts_end;
+            clock_gettime(CLOCK_MONOTONIC, &ts_end);
+            elapsed_ns = (ts_end.tv_sec - ts_start.tv_sec) * 1000000000 +
+                         (ts_end.tv_nsec - ts_start.tv_nsec);
+        }
 
         runTimer->disarm();
         if (usePerf && (!perfControlledByTimer)) {
@@ -802,8 +821,10 @@ BaseKvmCPU::kvmRun(Tick ticks)
         uint64_t instsExecuted = 0;
         if (usePerf) {
             instsExecuted = hwInstructions->read() - baseInstrs;
+            ticksExecuted = runTimer->ticksFromHostCycles(hostCyclesExecuted);
+        } else {
+            ticksExecuted = elapsed_ns * sim_clock::as_int::ns;
         }
-        ticksExecuted = runTimer->ticksFromHostCycles(hostCyclesExecuted);
 
         /* Update statistics */
         baseStats.numCycles += simCyclesExecuted;
