@@ -389,6 +389,10 @@ void
 MemDepUnit::reschedule(const DynInstPtr &inst)
 {
     instsToReplay.push_back(inst);
+    MemDepEntryPtr inst_entry = findInHash(inst);
+    if (inst_entry) {
+      inst_entry->released = false;
+    }
 }
 
 void

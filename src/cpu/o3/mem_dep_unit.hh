@@ -202,6 +202,8 @@ class MemDepUnit
 
         /** If the registers are ready or not. */
         bool regsReady = false;
+        /** If this entry has been released early or normally */
+        bool released = false;
         /** Number of memory dependencies that need to be satisfied. */
         int memDeps = 0;
         /** If the instruction is completed. */
