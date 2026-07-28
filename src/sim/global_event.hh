@@ -202,6 +202,15 @@ class GlobalEvent : public BaseGlobalEventTemplate<GlobalEvent>
     virtual void process() = 0;
 };
 
+class GlobalSyncCallback
+{
+  public:
+    virtual void handleSync() = 0;
+    virtual ~GlobalSyncCallback() {}
+};
+
+extern std::vector<GlobalSyncCallback *> globalSyncCallbacks;
+
 /**
  * A special global event that synchronizes all threads and forces
  * them to process asynchronously enqueued events.  Useful for

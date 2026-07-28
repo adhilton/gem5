@@ -29,6 +29,8 @@
 
 #include "sim/global_event.hh"
 
+#include <vector>
+
 #include "sim/cur_tick.hh"
 
 namespace gem5
@@ -154,9 +156,14 @@ GlobalSyncEvent::BarrierEvent::process()
     curEventQueue()->handleAsyncInsertions();
 }
 
+std::vector<GlobalSyncCallback *> globalSyncCallbacks;
+
 void
 GlobalSyncEvent::process()
 {
+    for (auto cb : globalSyncCallbacks) {
+        cb->handleSync();
+    }
     if (repeat) {
         schedule(curTick() + repeat);
     }

@@ -38,14 +38,17 @@
 #include "arch/arm/kvm/base_cpu.hh"
 
 #include <linux/kvm.h>
+
 #include <mutex>
 
 #include "arch/arm/interrupts.hh"
+#include "arch/arm/regs/misc.hh"
 #include "base/uncontended_mutex.hh"
 #include "debug/KvmInt.hh"
 #include "dev/arm/generic_timer.hh"
 #include "params/BaseArmKvmCPU.hh"
 #include "params/GenericTimer.hh"
+#include "sim/global_event.hh"
 
 namespace gem5
 {
@@ -73,21 +76,39 @@ namespace {
  * virtual time here, restore it before the first vcpu going into KVM, and save
  * it after the last vcpu back from KVM.
  */
-uint64_t vtime = 0;
 uint64_t vtime_counter = 0;
 UncontendedMutex vtime_mutex;
 
 }  // namespace
 
+uint64_t vtime = 0;
+
+std::vector<BaseArmKvmCPU *> BaseArmKvmCPU::allCPUs;
+
+class KvmTimerSyncCallback : public GlobalSyncCallback
+{
+  public:
+    void
+    handleSync() override
+    { BaseArmKvmCPU::globalTimerSync(); }
+};
+static KvmTimerSyncCallback timerSyncCallback;
+
 BaseArmKvmCPU::BaseArmKvmCPU(const BaseArmKvmCPUParams &params)
     : BaseKvmCPU(params),
-      irqAsserted(false), fiqAsserted(false),
-      virtTimerPin(nullptr), prevDeviceIRQLevel(0)
-{
-}
+      irqAsserted(false),
+      fiqAsserted(false),
+      virtTimerPin(nullptr),
+      prevDeviceIRQLevel(0),
+      timerOffsetRestored(false)
+{ allCPUs.push_back(this); }
 
 BaseArmKvmCPU::~BaseArmKvmCPU()
 {
+    auto it = std::find(allCPUs.begin(), allCPUs.end(), this);
+    if (it != allCPUs.end()) {
+        allCPUs.erase(it);
+    }
 }
 
 void
@@ -106,11 +127,25 @@ BaseArmKvmCPU::startup()
     if (!((ArmSystem *)system)->highestELIs64()) {
         target_config.features[0] |= (1 << KVM_ARM_VCPU_EL1_32BIT);
     }
+    target_config.features[0] |= (1 << KVM_ARM_VCPU_PSCI_0_2);
+    if (cpuId() > 0) {
+        target_config.features[0] |= (1 << KVM_ARM_VCPU_POWER_OFF);
+    }
     kvmArmVCpuInit(target_config);
+
+#if __aarch64__
+    uint64_t mpidr_id = ARM64_SYS_REG(0b11, 0b000, 0b0000, 0b0000, 0b101);
+    uint64_t mpidr_val = getOneRegU64(mpidr_id);
+    inform("KVM: CPU %d MPIDR_EL1 = 0x%lx\n", cpuId(), mpidr_val);
+#endif
 
     if (!vm->hasKernelIRQChip())
         virtTimerPin = static_cast<ArmSystem *>(system)\
             ->getGenericTimer()->params().int_el1_virt->get(tc);
+
+    if (cpuId() == 0 && system->threads.size() > 1) {
+        globalSyncCallbacks.push_back(&timerSyncCallback);
+    }
 }
 
 Tick
@@ -172,15 +207,39 @@ BaseArmKvmCPU::ioctlRun()
 {
     // Check if it's the first vcpu going into KVM. If yes, it should restore
     // the virtual time.
-    {
+    if (system->threads.size() == 1) {
         std::lock_guard<UncontendedMutex> l(vtime_mutex);
         if (vtime_counter++ == 0)
             setOneReg(KVM_REG_ARM_TIMER_CNT, vtime);
+    } else {
+        // For multicore, restore vtime once per vCPU on its first entry to KVM
+        if (!timerOffsetRestored) {
+            inform("BaseArmKvmCPU::ioctlRun: restoring vtime %lu on CPU "
+                   "%d first KVM entry\n",
+                   (unsigned long)vtime, cpuId());
+            setOneReg(KVM_REG_ARM_TIMER_CNT, vtime);
+            uint64_t cval = tc->readMiscReg(ArmISA::MISCREG_CNTV_CVAL_EL0);
+            if (cval > 0 && cval <= vtime) {
+                uint64_t new_cval = vtime + 10000000;
+                inform("BaseArmKvmCPU::ioctlRun: CPU %d timer CVAL %lu <= "
+                       "vtime %lu! Adjusting CVAL to %lu\n",
+                       cpuId(), (unsigned long)cval, (unsigned long)vtime,
+                       (unsigned long)new_cval);
+                tc->setMiscReg(ArmISA::MISCREG_CNTV_CVAL_EL0, new_cval);
+#if defined(__aarch64__)
+                uint64_t cval_sys_reg = KVM_REG_ARM64 | KVM_REG_SIZE_U64 |
+                                        KVM_REG_ARM64_SYSREG | (3 << 14) |
+                                        (3 << 11) | (14 << 7) | (0 << 3) | 2;
+                setOneReg(cval_sys_reg, new_cval);
+#endif
+            }
+            timerOffsetRestored = true;
+        }
     }
     BaseKvmCPU::ioctlRun();
     // Check if it's the last vcpu back from KVM. If yes, it should save the
     // virtual time.
-    {
+    if (system->threads.size() == 1) {
         std::lock_guard<UncontendedMutex> l(vtime_mutex);
         if (--vtime_counter == 0)
             getOneReg(KVM_REG_ARM_TIMER_CNT, &vtime);
@@ -236,6 +295,36 @@ BaseArmKvmCPU::getRegList(kvm_reg_list &regs) const
         }
     } else {
         return true;
+    }
+}
+void
+BaseArmKvmCPU::syncTimerOffset()
+{
+    std::lock_guard<UncontendedMutex> l(vtime_mutex);
+    if (allCPUs.empty()) {
+        return;
+    }
+
+    if (!allCPUs[0] || !allCPUs[0]->tc ||
+        allCPUs[0]->tc->status() != ThreadContext::Active) {
+        return;
+    }
+
+    uint64_t vtime = 0;
+    allCPUs[0]->getOneReg(KVM_REG_ARM_TIMER_CNT, &vtime);
+
+    for (auto cpu : allCPUs) {
+        if (cpu && cpu->tc && cpu->tc->status() == ThreadContext::Active) {
+            cpu->setOneReg(KVM_REG_ARM_TIMER_CNT, vtime);
+        }
+    }
+}
+
+void
+BaseArmKvmCPU::globalTimerSync()
+{
+    if (!allCPUs.empty()) {
+        allCPUs[0]->syncTimerOffset();
     }
 }
 

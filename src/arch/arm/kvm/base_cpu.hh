@@ -59,6 +59,8 @@ class BaseArmKvmCPU : public BaseKvmCPU
     virtual ~BaseArmKvmCPU();
 
     void startup() override;
+    void syncTimerOffset();
+    static void globalTimerSync();
 
   protected:
     Tick kvmRun(Tick ticks) override;
@@ -93,6 +95,7 @@ class BaseArmKvmCPU : public BaseKvmCPU
      * this class member.
      */
     uint64_t prevDeviceIRQLevel;
+    bool timerOffsetRestored;
 
   protected:
     typedef std::vector<uint64_t> RegIndexVector;
@@ -137,6 +140,8 @@ class BaseArmKvmCPU : public BaseKvmCPU
      * Cached copy of the list of registers supported by KVM
      */
     mutable RegIndexVector _regIndexList;
+
+    static std::vector<BaseArmKvmCPU *> allCPUs;
 };
 
 } // namespace gem5
