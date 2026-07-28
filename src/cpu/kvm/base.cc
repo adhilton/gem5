@@ -56,6 +56,7 @@
 #include "debug/KvmRun.hh"
 #include "params/BaseKvmCPU.hh"
 #include "sim/core.hh"
+#include "sim/eventq.hh"
 #include "sim/process.hh"
 #include "sim/system.hh"
 
@@ -336,10 +337,10 @@ BaseKvmCPU::drain()
     DPRINTF(Drain, "BaseKvmCPU::drain\n");
 
     // The event queue won't be locked when calling drain since that's
-    // not done from an event. Lock the event queue here to make sure
+    // not done from an event. Migrate to the event queue here to make sure
     // that scoped migrations continue to work if we need to
-    // synchronize the thread context.
-    std::lock_guard<EventQueue> lock(*this->eventQueue());
+    // synchronize the thread context without self-deadlocking.
+    EventQueue::ScopedMigration lock(this->eventQueue());
 
     switch (_status) {
       case Running:
@@ -925,6 +926,20 @@ BaseKvmCPU::setOneReg(uint64_t id, const void *addr)
 #endif
 }
 
+bool
+BaseKvmCPU::trySetOneReg(uint64_t id, const void *addr)
+{
+#ifdef KVM_SET_ONE_REG
+    struct kvm_one_reg reg;
+    reg.id = id;
+    reg.addr = (uint64_t)addr;
+
+    return ioctl(KVM_SET_ONE_REG, &reg) == 0;
+#else
+    return false;
+#endif
+}
+
 void
 BaseKvmCPU::getOneReg(uint64_t id, void *addr) const
 {
@@ -939,6 +954,20 @@ BaseKvmCPU::getOneReg(uint64_t id, void *addr) const
     }
 #else
     panic("KVM_GET_ONE_REG is unsupported on this platform.\n");
+#endif
+}
+
+bool
+BaseKvmCPU::tryGetOneReg(uint64_t id, void *addr) const
+{
+#ifdef KVM_GET_ONE_REG
+    struct kvm_one_reg reg;
+    reg.id = id;
+    reg.addr = (uint64_t)addr;
+
+    return ioctl(KVM_GET_ONE_REG, &reg) == 0;
+#else
+    return false;
 #endif
 }
 
@@ -1101,7 +1130,11 @@ BaseKvmCPU::handleKvmExitIO()
 Tick
 BaseKvmCPU::handleKvmExitHypercall()
 {
-    panic("KVM: Unhandled hypercall\n");
+    warn("KVM: Unhandled hypercall (nr: %llu, args: %llu, %llu, %llu, %llu)\n",
+         _kvmRun->hypercall.nr, _kvmRun->hypercall.args[0],
+         _kvmRun->hypercall.args[1], _kvmRun->hypercall.args[2],
+         _kvmRun->hypercall.args[3]);
+    return 0;
 }
 
 Tick
